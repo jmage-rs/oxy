@@ -24,6 +24,10 @@ pub(crate) fn get_acknowledgement_number(data: &[u8]) -> u32 {
     u32::from_le_bytes(acknowledgement_number)
 }
 
+pub(crate) fn set_acknowledgement_number(data: &mut [u8], acknowledgement_number: u32) {
+    data[12..18].copy_from_slice(&acknowledgement_number.to_le_bytes()[..]);
+}
+
 pub(crate) fn set_buffer_size(data: &mut [u8], buffer_size: u16) {
     data[18..20].copy_from_slice(&buffer_size.to_le_bytes()[..])
 }
@@ -41,4 +45,3 @@ pub(crate) fn get_payload<'a>(data: &'a [u8]) -> &'a [u8] {
 pub(crate) fn get_payload_mut<'a>(data: &'a mut [u8]) -> &'a mut [u8] {
     &mut data[20..292]
 }
-

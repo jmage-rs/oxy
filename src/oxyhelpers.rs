@@ -39,4 +39,8 @@ impl crate::oxy::Oxy {
     pub(crate) fn outer_key(&self) -> Vec<u8> {
         self.i.config.lock().outer_key.as_ref().unwrap().clone()
     }
+
+    pub(crate) fn destination(&self) -> ::std::net::SocketAddr {
+        self.i.destination.lock().as_ref().unwrap().clone()
+    }
 }

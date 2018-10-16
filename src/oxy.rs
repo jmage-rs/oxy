@@ -12,8 +12,10 @@ pub(crate) struct OxyInternal {
     pub(crate) config: ::parking_lot::Mutex<crate::config::Config>,
     socket: ::parking_lot::Mutex<Option<::mio::net::UdpSocket>>,
     socket_token: ::parking_lot::Mutex<Option<usize>>,
-    immortality: ::parking_lot::Mutex<Option<Oxy>>,
     noise: ::parking_lot::Mutex<Option<::snow::Session>>,
+    pocket_thread: ::parking_lot::Mutex<Option<::std::thread::JoinHandle<()>>>,
+    outbound_mid_sequence_number: ::parking_lot::Mutex<u32>,
+    pub(crate) destination: ::parking_lot::Mutex<Option<::std::net::SocketAddr>>,
 }
 
 impl Oxy {
@@ -40,23 +42,15 @@ impl Oxy {
         }
     }
 
-    fn make_immortal(&self) {
-        *self.i.immortality.lock() = Some(self.clone());
-    }
-
-    /// Allow this Oxy instance to be dropped if no external handle is held.
-    pub fn make_mortal(&self) {
-        self.i.immortality.lock().take();
-    }
-
     fn init_client(&self) {
-        self.make_immortal();
         let destination = self.i.config.lock().destination.as_ref().unwrap().clone();
-        let destination: ::std::net::SocketAddr =
+        *self.i.destination.lock() = Some(
             ::std::net::ToSocketAddrs::to_socket_addrs(&destination)
                 .expect("failed to resolve destination")
                 .next()
-                .expect("no address for destination");
+                .expect("no address for destination"),
+        );
+
         *self.i.noise.lock() = Some(
             ::snow::Builder::new("Noise_IK_25519_AESGCM_SHA512".parse().unwrap())
                 .local_private_key(&self.local_private_key())
@@ -64,10 +58,75 @@ impl Oxy {
                 .build_initiator()
                 .unwrap(),
         );
+        let socket = ::mio::net::UdpSocket::bind(&"0.0.0.0:0".parse().unwrap()).unwrap();
+        *self.i.socket.lock() = Some(socket);
+        self.spawn_pocket_thread();
     }
 
+    fn spawn_pocket_thread(&self) {
+        let pocket_thread = ::std::thread::spawn(|| transportation::run_worker());
+        let pocket_thread_id = pocket_thread.thread().id();
+        *self.i.pocket_thread.lock() = Some(pocket_thread);
+        let proxy = self.clone();
+        ::transportation::run_in_thread(pocket_thread_id, move || proxy.init_from_pocket_thread())
+            .unwrap();
+    }
+
+    fn init_from_pocket_thread(&self) {
+        match self.mode() {
+            crate::config::Mode::Server => self.init_server_from_pocket_thread(),
+            crate::config::Mode::Client => self.init_client_from_pocket_thread(),
+            _ => unimplemented!(),
+        }
+    }
+
+    fn send_inner_packet(&self, payload: &[u8]) {
+        crate::inner::frame(payload, |mid| {
+            self.send_mid_packet(mid);
+        });
+    }
+
+    fn send_mid_packet(&self, payload: &[u8]) {
+        let mut packet = [0u8; crate::outer::MID_PACKET_SIZE];
+        let sequence_number = {
+            let mut lock = self.i.outbound_mid_sequence_number.lock();
+            let mine = *lock;
+            let next = lock.checked_add(1).unwrap();
+            *lock = next;
+            mine
+        };
+        crate::mid::set_conversation_id(&mut packet, 0);
+        crate::mid::set_sequence_number(&mut packet, sequence_number);
+        crate::mid::set_acknowledgement_number(&mut packet, 0);
+        crate::mid::set_buffer_size(&mut packet, 0);
+        crate::mid::get_payload_mut(&mut packet).copy_from_slice(payload);
+        self.encrypt_outer_packet(&packet, |outer| {
+            self.i
+                .socket
+                .lock()
+                .as_mut()
+                .unwrap()
+                .send_to(outer, &self.destination())
+        })
+        .unwrap();
+    }
+
+    fn init_client_from_pocket_thread(&self) {
+        let mut buf = [0u8; 1024];
+        let len = self
+            .i
+            .noise
+            .lock()
+            .as_mut()
+            .unwrap()
+            .write_message(b"", &mut buf)
+            .unwrap();
+        self.send_inner_packet(&buf[..len]);
+    }
+
+    fn init_server_from_pocket_thread(&self) {}
+
     fn init_server(&self) {
-        self.make_immortal();
         let socket = ::mio::net::UdpSocket::bind(&"127.0.0.1:2600".parse().unwrap()).unwrap();
         self.info(|| "Successfully bound server socket");
         let weak = self.downgrade();
@@ -106,9 +165,17 @@ impl Oxy {
     fn process_mid_packet(&self, mid: &[u8]) {
         match self.mode() {
             crate::config::Mode::Server => {
-                let mut conversation_id = [0u8; 8];
-                conversation_id[..].copy_from_slice(&mid[..8]);
-                let conversation_id = u64::from_le_bytes(conversation_id);
+                self.info(|| {
+                    format!(
+                        "Server processing mid packet: {:?}, {:?}, {:?}, {:?}, {:?}",
+                        crate::mid::get_conversation_id(mid),
+                        crate::mid::get_sequence_number(mid),
+                        crate::mid::get_acknowledgement_number(mid),
+                        crate::mid::get_buffer_size(mid),
+                        crate::mid::get_payload(mid)
+                    )
+                });
+                let conversation_id = crate::mid::get_conversation_id(mid);
                 if conversation_id == 0 {
                     // make a new conversation
                 } else if self.knows_conversation_id(conversation_id) {
@@ -126,7 +193,7 @@ impl Oxy {
         }
     }
 
-    fn knows_conversation_id(&self, id: u64) -> bool {
+    fn knows_conversation_id(&self, _id: u64) -> bool {
         unimplemented!();
     }
 

@@ -15,7 +15,8 @@ pub mod oxy;
 
 mod base32;
 mod inner;
+mod innermessage;
 mod log;
+mod mid;
 mod outer;
 mod oxyhelpers;
-mod mid;
