@@ -16,6 +16,8 @@ pub(crate) struct OxyInternal {
     pocket_thread: ::parking_lot::Mutex<Option<::std::thread::JoinHandle<()>>>,
     outbound_mid_sequence_number: ::parking_lot::Mutex<u32>,
     pub(crate) destination: ::parking_lot::Mutex<Option<::std::net::SocketAddr>>,
+    conversations: ::parking_lot::Mutex<::std::collections::BTreeMap<u64, Oxy>>,
+    conversation_id_ticker: ::parking_lot::Mutex<u64>,
 }
 
 impl Oxy {
@@ -27,7 +29,7 @@ impl Oxy {
     }
 
     /// Create a new Oxy instance with a provided config.
-    pub fn new(config: &crate::config::Config) -> Oxy {
+    pub fn new(config: crate::config::Config) -> Oxy {
         let result: Oxy = Default::default();
         *result.i.config.lock() = config.clone();
         result.init();
@@ -38,8 +40,21 @@ impl Oxy {
         match self.mode() {
             crate::config::Mode::Server => self.init_server(),
             crate::config::Mode::Client => self.init_client(),
-            _ => unimplemented!(),
+            crate::config::Mode::ServerConnection => (),
         }
+    }
+
+    fn recv_mid(&self, mid: &[u8]) {
+        let mut buf = [0u8; 1024];
+        let len = self
+            .i
+            .noise
+            .lock()
+            .as_mut()
+            .unwrap()
+            .read_message(crate::mid::get_payload(mid), &mut buf)
+            .unwrap();
+        self.info(|| format!("Got {:?}", &buf[..len]));
     }
 
     fn init_client(&self) {
@@ -52,7 +67,7 @@ impl Oxy {
         );
 
         *self.i.noise.lock() = Some(
-            ::snow::Builder::new("Noise_IK_25519_AESGCM_SHA512".parse().unwrap())
+            ::snow::Builder::new(crate::NOISE_PATTERN.parse().unwrap())
                 .local_private_key(&self.local_private_key())
                 .remote_public_key(&self.remote_public_key())
                 .build_initiator()
@@ -177,13 +192,19 @@ impl Oxy {
                 });
                 let conversation_id = crate::mid::get_conversation_id(mid);
                 if conversation_id == 0 {
-                    // make a new conversation
-                } else if self.knows_conversation_id(conversation_id) {
-                    // dispatch the message to the conversation process.
+                    let conversation_id = self.make_conversation_id();
+                    let mut new_config = self.i.config.lock().clone();
+                    new_config.mode = Some(crate::config::Mode::ServerConnection);
+                    let worker = Oxy::new(new_config);
+                    self.i.conversations.lock().insert(conversation_id, worker);
                 } else {
-                    self.warn(|| {
-                        format!("Mid message for unknown conversation {}", conversation_id)
-                    });
+                    if let Some(worker) = self.i.conversations.lock().get_mut(&conversation_id) {
+                        worker.recv_mid(mid);
+                    } else {
+                        self.warn(|| {
+                            format!("Mid message for unknown conversation {}", conversation_id)
+                        });
+                    }
                 }
             }
             crate::config::Mode::Client => {
@@ -193,8 +214,15 @@ impl Oxy {
         }
     }
 
-    fn knows_conversation_id(&self, _id: u64) -> bool {
-        unimplemented!();
+    fn make_conversation_id(&self) -> u64 {
+        // IDK, I was thinking about having random conversation IDs as a hardening
+        // thing, but I'm not sure it actually buys anything. I'll come back to this
+        // later.
+        let mut lock = self.i.conversation_id_ticker.lock();
+        let mine = *lock;
+        let next = lock.checked_add(1).unwrap();
+        *lock = next;
+        mine
     }
 
     fn read_socket(&self) {

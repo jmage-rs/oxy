@@ -24,6 +24,12 @@ pub struct Config {
     #[serde(with = "crate::base32")]
     #[serde(default)]
     pub local_private_key: Option<Vec<u8>>,
+    /// The local public key
+    #[serde(with = "crate::base32")]
+    #[serde(default)]
+    pub local_public_key: Option<Vec<u8>>,
+    /// The UDP port number
+    pub port_number: Option<u16>,
 }
 
 /// The modes in which an Oxy instance can run.

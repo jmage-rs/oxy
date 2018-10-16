@@ -29,6 +29,17 @@ pub fn create_app() -> App<'static, 'static> {
                         .help("Base32 outer key"),
                 ),
         )
+        .subcommand(
+            SubCommand::with_name("raw")
+                .about("Run a configuration file directly")
+                .arg(Arg::with_name("filename").required(true)),
+        )
+        .subcommand(
+            SubCommand::with_name("config")
+                .about("Configure Oxy")
+                .setting(::clap::AppSettings::SubcommandRequired)
+                .subcommand(SubCommand::with_name("init-server")),
+        )
 }
 
 /// Generate a config data-structure based on command line arguments. Will load
@@ -40,6 +51,27 @@ where
     create_app()
         .get_matches_from_safe(args.iter().map(|x| x.as_ref()))
         .map(config_from_matches)
+}
+
+/// Like args_to_config, except handles args that do not meaningfully yield a
+/// config and exits after processing if there's no config to be had.
+pub fn execute_args<T>(args: &[&T]) -> Result<crate::config::Config, ::clap::Error>
+where
+    T: AsRef<str> + ?Sized,
+{
+    let matches = create_app().get_matches_from_safe(args.iter().map(|x| x.as_ref()));
+    if matches.is_err() {
+        return Err(matches.unwrap_err());
+    }
+    let matches = matches.unwrap();
+    match matches.subcommand() {
+        ("config", matches2) => {
+            crate::config_wizard::do_wizard(matches2.unwrap());
+            ::std::process::exit(0);
+        }
+        _ => (),
+    }
+    Ok(config_from_matches(matches))
 }
 
 fn config_from_matches(matches: ::clap::ArgMatches) -> crate::config::Config {
@@ -69,6 +101,12 @@ fn config_from_matches(matches: ::clap::ArgMatches) -> crate::config::Config {
                         .expect("invalid outer key cli argument"),
                 );
             }
+        }
+        ("raw", Some(matches2)) => {
+            let mut buf = Vec::new();
+            let mut file = ::std::fs::File::open(matches2.value_of("filename").unwrap()).unwrap();
+            ::std::io::Read::read_to_end(&mut file, &mut buf).unwrap();
+            return ::toml::from_slice(&buf).unwrap();
         }
         _ => (),
     }

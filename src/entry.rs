@@ -1,7 +1,7 @@
 //! This module contains entry points for the application.
 
 /// Execute a loaded config.
-pub fn run_config(config: &crate::config::Config) {
+pub fn run_config(config: crate::config::Config) {
     crate::oxy::Oxy::new(config);
     ::transportation::run();
 }
@@ -14,7 +14,7 @@ where
     T: AsRef<str> + ?Sized,
 {
     run_config(
-        &crate::arg::args_to_config(args)
+        crate::arg::execute_args(args)
             .map_err(|x| x.exit())
             .expect("impossible"),
     )

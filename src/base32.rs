@@ -2,7 +2,10 @@ pub fn serialize<S>(input: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::
 where
     S: serde::ser::Serializer,
 {
-    serializer.serialize_str(&data_encoding::BASE32_NOPAD.encode(&input.as_ref().unwrap()[..]))
+    if input.is_none() {
+        return serializer.serialize_none();
+    }
+    serializer.serialize_some(&data_encoding::BASE32_NOPAD.encode(&input.as_ref().unwrap()[..]))
 }
 
 pub fn deserialize<'de, D>(input: D) -> Result<Option<Vec<u8>>, D::Error>

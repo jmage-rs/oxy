@@ -14,9 +14,12 @@ pub mod entry;
 pub mod oxy;
 
 mod base32;
+mod config_wizard;
 mod inner;
 mod innermessage;
 mod log;
 mod mid;
 mod outer;
 mod oxyhelpers;
+
+pub(crate) const NOISE_PATTERN: &str = "Noise_IK_25519_AESGCM_SHA512";
