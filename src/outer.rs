@@ -1,4 +1,4 @@
-pub(crate) const MID_PACKET_SIZE: usize = 296;
+pub(crate) const MID_PACKET_SIZE: usize = 292;
 pub(crate) const OUTER_PACKET_SIZE: usize = MID_PACKET_SIZE + 16 + 24;
 
 pub(crate) fn encrypt_outer_packet<T, R>(key: &[u8], body: &[u8], callback: T) -> R
