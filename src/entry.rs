@@ -2,8 +2,7 @@
 
 /// Execute a loaded config.
 pub fn run_config(config: crate::config::Config) {
-    crate::oxy::Oxy::new(config);
-    ::transportation::run();
+    crate::oxy::Oxy::new(config).join();
 }
 
 /// Generate a config file based on command line arguments, then execute that

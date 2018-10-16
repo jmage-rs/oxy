@@ -1,4 +1,4 @@
-pub(crate) fn frame(data: &[u8], callback: impl Fn(&[u8])) {
+pub(crate) fn frame(data: &[u8], mut callback: impl FnMut(&[u8])) {
     let mut this_frame = [0u8; 256];
     let zeros = [0u8; 256];
     for chunk in data.chunks(255) {

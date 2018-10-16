@@ -14,6 +14,7 @@ pub(crate) struct OxyInternal {
     socket_token: ::parking_lot::Mutex<Option<usize>>,
     noise: ::parking_lot::Mutex<Option<::snow::Session>>,
     pocket_thread: ::parking_lot::Mutex<Option<::std::thread::JoinHandle<()>>>,
+    pocket_thread_id: ::parking_lot::Mutex<Option<::std::thread::ThreadId>>,
     outbound_mid_sequence_number: ::parking_lot::Mutex<u32>,
     pub(crate) destination: ::parking_lot::Mutex<Option<::std::net::SocketAddr>>,
     conversations: ::parking_lot::Mutex<::std::collections::BTreeMap<u64, Oxy>>,
@@ -40,8 +41,18 @@ impl Oxy {
         match self.mode() {
             crate::config::Mode::Server => self.init_server(),
             crate::config::Mode::Client => self.init_client(),
-            crate::config::Mode::ServerConnection => (),
+            crate::config::Mode::ServerConnection => self.init_server_connection(),
         }
+    }
+
+    fn init_server_connection(&self) {
+        let noise = ::snow::Builder::new(crate::NOISE_PATTERN.parse().unwrap())
+            .local_private_key(&self.local_private_key())
+            .remote_public_key(&self.remote_public_key())
+            .build_responder()
+            .unwrap();
+        *self.i.noise.lock() = Some(noise);
+        self.spawn_pocket_thread();
     }
 
     fn recv_mid(&self, mid: &[u8]) {
@@ -52,9 +63,18 @@ impl Oxy {
             .lock()
             .as_mut()
             .unwrap()
-            .read_message(crate::mid::get_payload(mid), &mut buf)
+            .read_message(&crate::mid::get_payload(mid)[1..97], &mut buf)
             .unwrap();
         self.info(|| format!("Got {:?}", &buf[..len]));
+    }
+
+    /// Wait for this oxy connection to finish.
+    pub fn join(&self) {
+        // If multiple threads try and join on the same instance, they'll all wind up
+        // waiting for the mutex for the joinhandle? So it kinda works out?
+        if let Some(thread) = self.i.pocket_thread.lock().take() {
+            thread.join().unwrap();
+        }
     }
 
     fn init_client(&self) {
@@ -79,9 +99,13 @@ impl Oxy {
     }
 
     fn spawn_pocket_thread(&self) {
+        let mut pocket_thread_lock = self.i.pocket_thread.lock();
+        let mut pocket_thread_id_lock = self.i.pocket_thread_id.lock();
+        assert!(pocket_thread_lock.is_none());
         let pocket_thread = ::std::thread::spawn(|| transportation::run_worker());
         let pocket_thread_id = pocket_thread.thread().id();
-        *self.i.pocket_thread.lock() = Some(pocket_thread);
+        *pocket_thread_lock = Some(pocket_thread);
+        *pocket_thread_id_lock = Some(pocket_thread_id);
         let proxy = self.clone();
         ::transportation::run_in_thread(pocket_thread_id, move || proxy.init_from_pocket_thread())
             .unwrap();
@@ -91,13 +115,21 @@ impl Oxy {
         match self.mode() {
             crate::config::Mode::Server => self.init_server_from_pocket_thread(),
             crate::config::Mode::Client => self.init_client_from_pocket_thread(),
-            _ => unimplemented!(),
+            crate::config::Mode::ServerConnection => (),
         }
     }
 
     fn send_inner_packet(&self, payload: &[u8]) {
         crate::inner::frame(payload, |mid| {
             self.send_mid_packet(mid);
+        });
+    }
+
+    fn send_inner_packet_fake_tag(&self, payload: &[u8]) {
+        let mut fake = [0u8; 272];
+        crate::inner::frame(payload, |mid| {
+            fake[..256].copy_from_slice(mid);
+            self.send_mid_packet(&fake);
         });
     }
 
@@ -136,13 +168,14 @@ impl Oxy {
             .unwrap()
             .write_message(b"", &mut buf)
             .unwrap();
-        self.send_inner_packet(&buf[..len]);
+        self.send_inner_packet_fake_tag(&buf[..len]);
     }
 
-    fn init_server_from_pocket_thread(&self) {}
-
-    fn init_server(&self) {
-        let socket = ::mio::net::UdpSocket::bind(&"127.0.0.1:2600".parse().unwrap()).unwrap();
+    fn init_server_from_pocket_thread(&self) {
+        let port = self.port_number();
+        let ip: ::std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let bind_addr = ::std::net::SocketAddr::new(ip, port);
+        let socket = ::mio::net::UdpSocket::bind(&bind_addr).unwrap();
         self.info(|| "Successfully bound server socket");
         let weak = self.downgrade();
         let token_holder = ::std::rc::Rc::new(::std::cell::RefCell::new(0));
@@ -165,6 +198,10 @@ impl Oxy {
         });
         *self.i.socket.lock() = Some(socket);
         *self.i.socket_token.lock() = Some(token);
+    }
+
+    fn init_server(&self) {
+        self.spawn_pocket_thread();
     }
 
     fn mode(&self) -> crate::config::Mode {
@@ -196,6 +233,7 @@ impl Oxy {
                     let mut new_config = self.i.config.lock().clone();
                     new_config.mode = Some(crate::config::Mode::ServerConnection);
                     let worker = Oxy::new(new_config);
+                    worker.recv_mid(mid);
                     self.i.conversations.lock().insert(conversation_id, worker);
                 } else {
                     if let Some(worker) = self.i.conversations.lock().get_mut(&conversation_id) {
@@ -235,6 +273,7 @@ impl Oxy {
                         continue;
                     }
                     let decrypt = self.decrypt_outer_packet(&buf, |mid| {
+                        self.info(|| "Got a mid packet");
                         self.process_mid_packet(mid);
                     });
                     if decrypt.is_err() {

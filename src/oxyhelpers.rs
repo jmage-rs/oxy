@@ -43,4 +43,8 @@ impl crate::oxy::Oxy {
     pub(crate) fn destination(&self) -> ::std::net::SocketAddr {
         self.i.destination.lock().as_ref().unwrap().clone()
     }
+
+    pub(crate) fn port_number(&self) -> u16 {
+        self.i.config.lock().port_number.unwrap_or(2600)
+    }
 }
