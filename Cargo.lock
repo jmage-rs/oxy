@@ -486,6 +486,7 @@ dependencies = [
 name = "oxy"
 version = "4.0.0-dev"
 dependencies = [
+ "arrayvec 0.4.7 (registry+https://github.com/rust-lang/crates.io-index)",
  "clap 2.32.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "data-encoding 2.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "libsodium-sys 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",

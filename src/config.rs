@@ -33,7 +33,7 @@ pub struct Config {
 }
 
 /// The modes in which an Oxy instance can run.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     /// A server that manages a UDP socket and passes the data forward to the
     /// relevant connection processor Oxy instance. Creates connection

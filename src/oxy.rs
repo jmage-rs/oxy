@@ -19,6 +19,7 @@ pub(crate) struct OxyInternal {
     pub(crate) destination: ::parking_lot::Mutex<Option<::std::net::SocketAddr>>,
     conversations: ::parking_lot::Mutex<::std::collections::BTreeMap<u64, Oxy>>,
     conversation_id_ticker: ::parking_lot::Mutex<u64>,
+    incoming_frame_buffer: ::parking_lot::Mutex<::arrayvec::ArrayVec<[[u8; 255]; 64]>>,
 }
 
 impl Oxy {
@@ -34,6 +35,12 @@ impl Oxy {
         let result: Oxy = Default::default();
         *result.i.config.lock() = config.clone();
         result.init();
+        result
+    }
+
+    fn new_deferred(config: crate::config::Config) -> Oxy {
+        let result: Oxy = Default::default();
+        *result.i.config.lock() = config.clone();
         result
     }
 
@@ -55,20 +62,73 @@ impl Oxy {
         self.spawn_pocket_thread();
     }
 
-    fn recv_mid(&self, mid: &[u8]) {
-        let mut buf = [0u8; 1024];
-        let len = self
-            .i
-            .noise
-            .lock()
-            .as_mut()
-            .unwrap()
-            .read_message(&crate::mid::get_payload(mid)[1..97], &mut buf)
-            .unwrap();
-        self.info(|| format!("Got {:?}", &buf[..len]));
+    fn recv_inner(&self, inner: &[u8]) {
+        if inner[0] == 255 {
+            let mut frame = [0u8; 255];
+            frame.copy_from_slice(&inner[1..]);
+            self.i.incoming_frame_buffer.lock().push(frame);
+            return;
+        }
+        let mut buf = [0u8; 16574];
+        let mut caret = 0usize;
+        for i in self.i.incoming_frame_buffer.lock().iter() {
+            buf[caret..caret + 255].copy_from_slice(&i[..]);
+            caret += 255;
+        }
+        self.i.incoming_frame_buffer.lock().clear();
+        buf[caret..(caret + (inner[0] as usize))]
+            .copy_from_slice(&inner[1..(1 + (inner[0] as usize))]);
+        caret += inner[0] as usize;
+        self.recv_inner_full(&buf[..caret]);
     }
 
-    /// Wait for this oxy connection to finish.
+    fn recv_inner_full(&self, message: &[u8]) {
+        let message: crate::innermessage::InnerMessage = ::serde_cbor::from_slice(message).unwrap();
+        println!("{:?}", message);
+    }
+
+    fn recv_mid(&self, mid: &[u8]) {
+        let mut buf = [0u8; 1024];
+        let mut noise_lock = self.i.noise.lock();
+        if noise_lock.as_ref().unwrap().is_handshake_finished() {
+            let noise = noise_lock.as_mut().unwrap();
+            let len = noise
+                .read_message(&crate::mid::get_payload(mid), &mut buf)
+                .unwrap();
+            assert!(len == 256);
+            self.recv_inner(&buf[..256]);
+        } else {
+            let mut noise = noise_lock.take().unwrap();
+            let payload = crate::mid::get_payload(mid);
+            assert!(payload[0] == 96 || payload[0] == 48);
+            let frameend: usize = 1 + (payload[0] as usize);
+            let mut len = noise
+                .read_message(&crate::mid::get_payload(mid)[1..frameend], &mut buf)
+                .unwrap();
+            assert!(len == 0);
+            if !noise.is_initiator() {
+                len = noise.write_message(b"", &mut buf).unwrap();
+                self.send_inner_packet_fake_tag(&buf[..len]);
+            }
+            let noise = noise.into_transport_mode().unwrap();
+            *noise_lock = Some(noise);
+            self.info(|| "Handshake completed");
+            self.send_inner_message(crate::innermessage::InnerMessage::Dummy {});
+        }
+    }
+
+    fn send_inner_message(&self, message: crate::innermessage::InnerMessage) {
+        let mut message_buf = [0u8; 16574];
+        let len: usize;
+        {
+            let mut message_buf_cursor = ::std::io::Cursor::new(&mut message_buf[..]);
+            ::serde_cbor::to_writer(&mut message_buf_cursor, &message).unwrap();
+            len = ::num::NumCast::from(message_buf_cursor.position()).unwrap();
+        }
+        self.send_inner_packet(&message_buf[..len]);
+    }
+
+    /// Wait for this oxy instance to finish.
     pub fn join(&self) {
         // If multiple threads try and join on the same instance, they'll all wind up
         // waiting for the mutex for the joinhandle? So it kinda works out?
@@ -121,7 +181,17 @@ impl Oxy {
 
     fn send_inner_packet(&self, payload: &[u8]) {
         crate::inner::frame(payload, |mid| {
-            self.send_mid_packet(mid);
+            let mut buf = [0u8; 272];
+            let len = self
+                .i
+                .noise
+                .lock()
+                .as_mut()
+                .unwrap()
+                .write_message(&mid, &mut buf[..])
+                .unwrap();
+            assert!(len == 272);
+            self.send_mid_packet(&buf[..]);
         });
     }
 
@@ -159,6 +229,22 @@ impl Oxy {
     }
 
     fn init_client_from_pocket_thread(&self) {
+        let weak = self.downgrade();
+        let token = ::transportation::insert_listener(move |event| match weak.upgrade() {
+            Some(oxy) => oxy.socket_event(event),
+            None => {
+                transportation::stop();
+            }
+        });
+        ::transportation::borrow_poll(|poll| {
+            poll.register(
+                self.i.socket.lock().as_ref().unwrap(),
+                ::mio::Token(token),
+                ::mio::Ready::readable(),
+                ::mio::PollOpt::edge(),
+            )
+            .unwrap()
+        });
         let mut buf = [0u8; 1024];
         let len = self
             .i
@@ -178,15 +264,12 @@ impl Oxy {
         let socket = ::mio::net::UdpSocket::bind(&bind_addr).unwrap();
         self.info(|| "Successfully bound server socket");
         let weak = self.downgrade();
-        let token_holder = ::std::rc::Rc::new(::std::cell::RefCell::new(0));
-        let token_holder2 = token_holder.clone();
         let token = ::transportation::insert_listener(move |event| match weak.upgrade() {
             Some(oxy) => oxy.socket_event(event),
             None => {
-                transportation::remove_listener(*token_holder.borrow());
+                transportation::stop();
             }
         });
-        *token_holder2.borrow_mut() = token;
         ::transportation::borrow_poll(|poll| {
             poll.register(
                 &socket,
@@ -214,7 +297,7 @@ impl Oxy {
         }
     }
 
-    fn process_mid_packet(&self, mid: &[u8]) {
+    fn process_mid_packet(&self, src: ::std::net::SocketAddr, mid: &[u8]) {
         match self.mode() {
             crate::config::Mode::Server => {
                 self.info(|| {
@@ -232,7 +315,11 @@ impl Oxy {
                     let conversation_id = self.make_conversation_id();
                     let mut new_config = self.i.config.lock().clone();
                     new_config.mode = Some(crate::config::Mode::ServerConnection);
-                    let worker = Oxy::new(new_config);
+                    let worker = Oxy::new_deferred(new_config);
+                    *worker.i.socket.lock() =
+                        Some(self.i.socket.lock().as_ref().unwrap().try_clone().unwrap());
+                    *worker.i.destination.lock() = Some(src);
+                    worker.init();
                     worker.recv_mid(mid);
                     self.i.conversations.lock().insert(conversation_id, worker);
                 } else {
@@ -246,7 +333,7 @@ impl Oxy {
                 }
             }
             crate::config::Mode::Client => {
-                // Feed the packet into the noise session
+                self.recv_mid(mid);
             }
             _ => unimplemented!(),
         }
@@ -266,15 +353,16 @@ impl Oxy {
     fn read_socket(&self) {
         loop {
             let mut buf = [0u8; crate::outer::OUTER_PACKET_SIZE];
-            match self.i.socket.lock().as_ref().unwrap().recv_from(&mut buf) {
-                Ok((amt, _src)) => {
+            let result = self.i.socket.lock().as_ref().unwrap().recv_from(&mut buf);
+            match result {
+                Ok((amt, src)) => {
                     if amt != crate::outer::OUTER_PACKET_SIZE {
                         self.warn(|| "Read less than one message worth in one call.");
                         continue;
                     }
                     let decrypt = self.decrypt_outer_packet(&buf, |mid| {
                         self.info(|| "Got a mid packet");
-                        self.process_mid_packet(mid);
+                        self.process_mid_packet(src, mid);
                     });
                     if decrypt.is_err() {
                         self.warn(|| "Rejecting packet with bad tag.");

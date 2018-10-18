@@ -1,5 +1,5 @@
 #[derive(Serialize, Deserialize, Debug)]
-enum InnerMessage {
+pub enum InnerMessage {
     Dummy {},
     ProtocolVersionAnnounce { version: u64 },
     Rekey { new_material: Vec<u8> },
