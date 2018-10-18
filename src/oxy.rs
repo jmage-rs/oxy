@@ -20,6 +20,47 @@ pub(crate) struct OxyInternal {
     conversations: ::parking_lot::Mutex<::std::collections::BTreeMap<u64, Oxy>>,
     conversation_id_ticker: ::parking_lot::Mutex<u64>,
     incoming_frame_buffer: ::parking_lot::Mutex<::arrayvec::ArrayVec<[[u8; 255]; 64]>>,
+    my_conversation_id: ::parking_lot::Mutex<u64>,
+    outbound_id_ticker: ::parking_lot::Mutex<u64>,
+    inbound_id_ticker: ::parking_lot::Mutex<u64>,
+    recv_lock: ::parking_lot::Mutex<()>,
+    pub(crate) ui: crate::ui::UiData,
+    message_watchers: ::parking_lot::Mutex<
+        Vec<
+            Box<
+                Fn(&Oxy, u64, &crate::innermessage::InnerMessage) -> MessageWatcherResult
+                    + Send
+                    + 'static,
+            >,
+        >,
+    >,
+}
+
+thread_local! {
+    /// Should only be filled in if this is an Oxy pocket thread. If so, contains a weak reference to the Oxy that owns this thread.
+    static OXY: ::std::cell::RefCell<Option<OxyWeak>> = ::std::cell::RefCell::new(None);
+}
+
+/// Get the Oxy that this is a pocket thread for. Panics if this is not an Oxy
+/// pocket thread.
+pub(crate) fn get_oxy() -> Oxy {
+    OXY.with(|x| {
+        x.borrow()
+            .as_ref()
+            .expect("get_oxy called from not an oxy pocket thread")
+            .upgrade()
+            .expect("this is an oxy pocket thread, but the oxy instance was dropped?")
+    })
+}
+
+/// The type to be returned by a message watcher callback.
+pub struct MessageWatcherResult {
+    /// If true, the callback will be retained and called with subsequent
+    /// messages. If false, the callback will be removed.
+    pub keep_watching: bool,
+    /// If true, no further callbacks will be called on the current message. If
+    /// false, other callbacks will be called.
+    pub consume_message: bool,
 }
 
 impl Oxy {
@@ -71,20 +112,62 @@ impl Oxy {
         }
         let mut buf = [0u8; 16574];
         let mut caret = 0usize;
-        for i in self.i.incoming_frame_buffer.lock().iter() {
+        let mut lock = self.i.incoming_frame_buffer.lock();
+        let inbound_number = self.tick_inbound();
+        for i in lock.iter() {
             buf[caret..caret + 255].copy_from_slice(&i[..]);
             caret += 255;
         }
-        self.i.incoming_frame_buffer.lock().clear();
+        lock.clear();
         buf[caret..(caret + (inner[0] as usize))]
             .copy_from_slice(&inner[1..(1 + (inner[0] as usize))]);
         caret += inner[0] as usize;
-        self.recv_inner_full(&buf[..caret]);
+        ::std::mem::drop(lock);
+        self.recv_inner_full(inbound_number, &buf[..caret]);
     }
 
-    fn recv_inner_full(&self, message: &[u8]) {
+    fn tick_inbound(&self) -> u64 {
+        let mut lock = self.i.inbound_id_ticker.lock();
+        let mine = *lock;
+        *lock = lock.checked_add(1).unwrap();
+        mine
+    }
+
+    fn recv_inner_full(&self, inbound_number: u64, message: &[u8]) {
         let message: crate::innermessage::InnerMessage = ::serde_cbor::from_slice(message).unwrap();
-        println!("{:?}", message);
+        if self.in_own_thread() {
+            self.handle_message(inbound_number, &message);
+        } else {
+            self.do_in_thread(move || get_oxy().handle_message(inbound_number, &message));
+        }
+    }
+
+    fn handle_message(&self, inbound_number: u64, message: &crate::innermessage::InnerMessage) {
+        {
+            let _lock = self.i.recv_lock.lock();
+        }
+        let mut watchers = Vec::new();
+        ::std::mem::swap(&mut watchers, &mut *self.i.message_watchers.lock());
+        while !watchers.is_empty() {
+            let watcher = watchers.pop().unwrap();
+            let result = (*watcher)(self, inbound_number, message);
+            if result.keep_watching {
+                self.i.message_watchers.lock().push(watcher);
+            }
+            if result.consume_message {
+                self.i.message_watchers.lock().extend(watchers);
+                break;
+            }
+        }
+    }
+
+    fn watch(
+        &self,
+        callback: impl Fn(&Oxy, u64, &crate::innermessage::InnerMessage) -> MessageWatcherResult
+            + Send
+            + 'static,
+    ) {
+        self.i.message_watchers.lock().push(Box::new(callback))
     }
 
     fn recv_mid(&self, mid: &[u8]) {
@@ -96,6 +179,7 @@ impl Oxy {
                 .read_message(&crate::mid::get_payload(mid), &mut buf)
                 .unwrap();
             assert!(len == 256);
+            ::std::mem::drop(noise_lock);
             self.recv_inner(&buf[..256]);
         } else {
             let mut noise = noise_lock.take().unwrap();
@@ -109,16 +193,59 @@ impl Oxy {
             if !noise.is_initiator() {
                 len = noise.write_message(b"", &mut buf).unwrap();
                 self.send_inner_packet_fake_tag(&buf[..len]);
+            } else {
+                self.info(|| {
+                    format!(
+                        "Setting conversation id to {}",
+                        crate::mid::get_conversation_id(mid)
+                    )
+                });
+                *self.i.my_conversation_id.lock() = crate::mid::get_conversation_id(mid);
             }
             let noise = noise.into_transport_mode().unwrap();
             *noise_lock = Some(noise);
             self.info(|| "Handshake completed");
             ::std::mem::drop(noise_lock);
-            self.send_inner_message(crate::innermessage::InnerMessage::Dummy {});
+            self.init_post_handshake();
         }
     }
 
-    fn send_inner_message(&self, message: crate::innermessage::InnerMessage) {
+    fn init_post_handshake(&self) {
+        let _recv_lock = self.i.recv_lock.lock();
+        match self.mode() {
+            crate::config::Mode::Client => {
+                self.init_ui();
+            }
+            _ => (),
+        }
+        self.watch(Oxy::log_message);
+        self.watch(Oxy::pong);
+        self.send_inner_message(crate::innermessage::InnerMessage::ProtocolVersionAnnounce {
+            version: crate::PROTOCOL_VERSION,
+        });
+        let outbound_id = self.send_inner_message(crate::innermessage::InnerMessage::Ping {});
+        self.watch(move |a, _b, c| match c {
+            crate::innermessage::InnerMessage::Pong { message_number }
+                if *message_number == outbound_id =>
+            {
+                a.info(|| format!("Got my pong! {:?}", c));
+                MessageWatcherResult {
+                    keep_watching: false,
+                    consume_message: true,
+                }
+            }
+            _ => {
+                a.info(|| format!("Watcher ignoring: {:?}", c));
+                MessageWatcherResult {
+                    keep_watching: true,
+                    consume_message: false,
+                }
+            }
+        });
+    }
+
+    pub(crate) fn send_inner_message(&self, message: crate::innermessage::InnerMessage) -> u64 {
+        let mut outbound_id_ticker_lock = self.i.outbound_id_ticker.lock();
         let mut message_buf = [0u8; 16574];
         let len: usize;
         {
@@ -127,6 +254,9 @@ impl Oxy {
             len = ::num::NumCast::from(message_buf_cursor.position()).unwrap();
         }
         self.send_inner_packet(&message_buf[..len]);
+        let mine = *outbound_id_ticker_lock;
+        *outbound_id_ticker_lock = outbound_id_ticker_lock.checked_add(1).unwrap();
+        mine
     }
 
     /// Wait for this oxy instance to finish.
@@ -163,7 +293,11 @@ impl Oxy {
         let mut pocket_thread_lock = self.i.pocket_thread.lock();
         let mut pocket_thread_id_lock = self.i.pocket_thread_id.lock();
         assert!(pocket_thread_lock.is_none());
-        let pocket_thread = ::std::thread::spawn(|| transportation::run_worker());
+        let weak = self.downgrade();
+        let pocket_thread = ::std::thread::spawn(move || {
+            OXY.with(|x| *x.borrow_mut() = Some(weak));
+            transportation::run_worker()
+        });
         let pocket_thread_id = pocket_thread.thread().id();
         *pocket_thread_lock = Some(pocket_thread);
         *pocket_thread_id_lock = Some(pocket_thread_id);
@@ -213,7 +347,9 @@ impl Oxy {
             *lock = next;
             mine
         };
-        crate::mid::set_conversation_id(&mut packet, 0);
+        let conversation_id = *self.i.my_conversation_id.lock();
+        self.info(|| format!("Using conversation id {}", conversation_id));
+        crate::mid::set_conversation_id(&mut packet, conversation_id);
         crate::mid::set_sequence_number(&mut packet, sequence_number);
         crate::mid::set_acknowledgement_number(&mut packet, 0);
         crate::mid::set_buffer_size(&mut packet, 0);
@@ -285,6 +421,7 @@ impl Oxy {
     }
 
     fn init_server(&self) {
+        *self.i.conversation_id_ticker.lock() = 1;
         self.spawn_pocket_thread();
     }
 
@@ -320,8 +457,9 @@ impl Oxy {
                     *worker.i.socket.lock() =
                         Some(self.i.socket.lock().as_ref().unwrap().try_clone().unwrap());
                     *worker.i.destination.lock() = Some(src);
+                    *worker.i.my_conversation_id.lock() = conversation_id;
                     worker.init();
-                    worker.recv_mid(mid);
+                    worker.recv_mid(&mid);
                     self.i.conversations.lock().insert(conversation_id, worker);
                 } else {
                     if let Some(worker) = self.i.conversations.lock().get_mut(&conversation_id) {
@@ -338,6 +476,18 @@ impl Oxy {
             }
             _ => unimplemented!(),
         }
+    }
+
+    pub(crate) fn in_own_thread(&self) -> bool {
+        ::std::thread::current().id() == *self.i.pocket_thread_id.lock().as_ref().unwrap()
+    }
+
+    fn do_in_thread(&self, callback: impl Fn() + Send + 'static) {
+        ::transportation::run_in_thread(
+            *self.i.pocket_thread_id.lock().as_ref().unwrap(),
+            callback,
+        )
+        .unwrap();
     }
 
     fn make_conversation_id(&self) -> u64 {

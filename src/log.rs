@@ -8,6 +8,7 @@ impl crate::oxy::Oxy {
         T: FnOnce() -> R,
         R: ::std::fmt::Display,
     {
+        let _guard = self.tmp_cooked();
         println!("WARN: {}", (callback)());
     }
 
@@ -16,6 +17,7 @@ impl crate::oxy::Oxy {
         T: FnOnce() -> R,
         R: ::std::fmt::Display,
     {
+        let _guard = self.tmp_cooked();
         println!("INFO: {}", (callback)());
     }
 }

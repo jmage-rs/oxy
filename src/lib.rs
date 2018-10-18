@@ -18,8 +18,11 @@ mod config_wizard;
 mod inner;
 mod innermessage;
 mod log;
+mod messagewatchers;
 mod mid;
 mod outer;
 mod oxyhelpers;
+mod ui;
 
 pub(crate) const NOISE_PATTERN: &str = "Noise_IK_25519_AESGCM_SHA512";
+pub(crate) const PROTOCOL_VERSION: u64 = 0;
