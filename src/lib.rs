@@ -22,6 +22,7 @@ mod messagewatchers;
 mod mid;
 mod outer;
 mod oxyhelpers;
+mod pty;
 mod ui;
 
 pub(crate) const NOISE_PATTERN: &str = "Noise_IK_25519_AESGCM_SHA512";

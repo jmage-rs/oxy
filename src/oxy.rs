@@ -25,6 +25,7 @@ pub(crate) struct OxyInternal {
     inbound_id_ticker: ::parking_lot::Mutex<u64>,
     recv_lock: ::parking_lot::Mutex<()>,
     pub(crate) ui: crate::ui::UiData,
+    pub(crate) pty: crate::pty::PtyData,
     message_watchers: ::parking_lot::Mutex<
         Vec<
             Box<
