@@ -113,6 +113,7 @@ impl Oxy {
             let noise = noise.into_transport_mode().unwrap();
             *noise_lock = Some(noise);
             self.info(|| "Handshake completed");
+            ::std::mem::drop(noise_lock);
             self.send_inner_message(crate::innermessage::InnerMessage::Dummy {});
         }
     }
