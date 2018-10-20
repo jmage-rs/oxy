@@ -19,6 +19,7 @@ mod inner;
 mod innermessage;
 mod log;
 mod messagewatchers;
+mod metacommand;
 mod mid;
 mod outer;
 mod oxyhelpers;

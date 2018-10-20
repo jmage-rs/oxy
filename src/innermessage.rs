@@ -7,7 +7,8 @@ pub enum InnerMessage {
     Accept { message_number: u64 },
     Ping {},
     Pong { message_number: u64 },
-    PtyRequest { command: Vec<String> },
-    PtyInput { input: Vec<u8>, id: u64 },
-    PtyOutput { output: Vec<u8>, id: u64 },
+    PtyRequest { path: String, argv: Vec<String> },
+    PtyInput { id: u64, input: Vec<u8> },
+    PtyOutput { id: u64, output: Vec<u8> },
+    PtySizeAdvertisement { id: u64, w: u16, h: u16 },
 }

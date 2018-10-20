@@ -1,3 +1,5 @@
+use crate::innermessage::InnerMessage;
+
 #[derive(Default)]
 pub struct UiData {
     raw: ::parking_lot::Mutex<Option<::termion::raw::RawTerminal<::std::fs::File>>>,
@@ -26,13 +28,33 @@ impl crate::oxy::Oxy {
         let mut buf = [0u8; 512];
         let mut tty = ::termion::get_tty().unwrap();
         let len = ::std::io::Read::read(&mut tty, &mut buf[..]).unwrap();
-        self.info(|| format!("read {:?}", &buf[..len]));
         if &buf[..len] == &[27, 91, 50, 52, 126][..] {
             // F12
-            self.cooked();
+            ::transportation::stop();
+        } else if &buf[..len] == &[27, 91, 50, 49, 126][..] {
+            // F10
+            let _guard = self.tmp_cooked();
+            let reader = ::linefeed::Interface::new("oxy").unwrap();
+            reader.set_prompt("oxy> ").unwrap();
+            match reader.read_line() {
+                Ok(::linefeed::ReadResult::Input(line)) => self.do_metacommand(&line),
+                _ => (),
+            };
+        } else {
+            self.send_inner_message(InnerMessage::PtyInput {
+                input: buf[..len].to_vec(),
+                id: 0,
+            });
         }
     }
 
+    pub(crate) fn send_tty_size_update(&self) {
+        assert!(self.mode() == crate::config::Mode::Client);
+        let (w, h) = ::termion::terminal_size().unwrap();
+        self.send_inner_message(InnerMessage::PtySizeAdvertisement { id: 0, w, h });
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn cooked(&self) {
         self.i.ui.raw.lock().take();
     }

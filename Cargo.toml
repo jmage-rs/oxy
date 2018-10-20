@@ -22,3 +22,5 @@ num = "0.2.0"
 arrayvec = "0.4.7"
 termion = "1.5.1"
 nix = "0.11.0"
+linefeed = "0.5.3"
+signal-hook = { version = "0.1.5", features = ["mio-support"] }

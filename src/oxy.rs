@@ -1,11 +1,17 @@
 //! This module contains the main data structure for an Oxy connection.
 
+use crate::innermessage::InnerMessage;
+#[allow(unused_imports)]
+use crate::messagewatchers::{DONE, EAT, IGNORE};
+
 /// The main data structure for an Oxy connection. This data structure is Send
 /// + Sync and internally mutable.
 #[derive(Default, Clone)]
 pub struct Oxy {
     pub(crate) i: ::std::sync::Arc<OxyInternal>,
 }
+
+type MessageWatcher = dyn Fn(&Oxy, u64, &InnerMessage) -> MessageWatcherResult + Send;
 
 #[derive(Default)]
 pub(crate) struct OxyInternal {
@@ -26,15 +32,8 @@ pub(crate) struct OxyInternal {
     recv_lock: ::parking_lot::Mutex<()>,
     pub(crate) ui: crate::ui::UiData,
     pub(crate) pty: crate::pty::PtyData,
-    message_watchers: ::parking_lot::Mutex<
-        Vec<
-            Box<
-                Fn(&Oxy, u64, &crate::innermessage::InnerMessage) -> MessageWatcherResult
-                    + Send
-                    + 'static,
-            >,
-        >,
-    >,
+    message_watchers: ::parking_lot::Mutex<Vec<Box<MessageWatcher>>>,
+    signal_iterator: ::parking_lot::Mutex<Option<::signal_hook::iterator::Signals>>,
 }
 
 thread_local! {
@@ -55,6 +54,7 @@ pub(crate) fn get_oxy() -> Oxy {
 }
 
 /// The type to be returned by a message watcher callback.
+#[derive(Clone, Debug, Copy)]
 pub struct MessageWatcherResult {
     /// If true, the callback will be retained and called with subsequent
     /// messages. If false, the callback will be removed.
@@ -135,7 +135,7 @@ impl Oxy {
     }
 
     fn recv_inner_full(&self, inbound_number: u64, message: &[u8]) {
-        let message: crate::innermessage::InnerMessage = ::serde_cbor::from_slice(message).unwrap();
+        let message: InnerMessage = ::serde_cbor::from_slice(message).unwrap();
         if self.in_own_thread() {
             self.handle_message(inbound_number, &message);
         } else {
@@ -143,7 +143,7 @@ impl Oxy {
         }
     }
 
-    fn handle_message(&self, inbound_number: u64, message: &crate::innermessage::InnerMessage) {
+    fn handle_message(&self, inbound_number: u64, message: &InnerMessage) {
         {
             let _lock = self.i.recv_lock.lock();
         }
@@ -162,11 +162,9 @@ impl Oxy {
         }
     }
 
-    fn watch(
+    pub(crate) fn watch(
         &self,
-        callback: impl Fn(&Oxy, u64, &crate::innermessage::InnerMessage) -> MessageWatcherResult
-            + Send
-            + 'static,
+        callback: impl Fn(&Oxy, u64, &InnerMessage) -> MessageWatcherResult + Send + 'static,
     ) {
         self.i.message_watchers.lock().push(Box::new(callback))
     }
@@ -219,33 +217,52 @@ impl Oxy {
             }
             _ => (),
         }
-        self.watch(Oxy::log_message);
         self.watch(Oxy::pong);
-        self.send_inner_message(crate::innermessage::InnerMessage::ProtocolVersionAnnounce {
+        self.send_inner_message(InnerMessage::ProtocolVersionAnnounce {
             version: crate::PROTOCOL_VERSION,
         });
-        let outbound_id = self.send_inner_message(crate::innermessage::InnerMessage::Ping {});
+        let outbound_id = self.send_inner_message(InnerMessage::Ping {});
         self.watch(move |a, _b, c| match c {
-            crate::innermessage::InnerMessage::Pong { message_number }
-                if *message_number == outbound_id =>
-            {
+            InnerMessage::Pong { message_number } if *message_number == outbound_id => {
                 a.info(|| format!("Got my pong! {:?}", c));
-                MessageWatcherResult {
-                    keep_watching: false,
-                    consume_message: true,
-                }
+                DONE
             }
             _ => {
                 a.info(|| format!("Watcher ignoring: {:?}", c));
-                MessageWatcherResult {
-                    keep_watching: true,
-                    consume_message: false,
-                }
+                IGNORE
             }
         });
+
+        match self.mode() {
+            crate::config::Mode::ServerConnection => {
+                self.watch(Oxy::log_message);
+                self.watch(|a, b, c| match c {
+                    InnerMessage::PtyRequest { .. } => {
+                        println!("Pty request");
+                        a.new_pty(b);
+                        DONE
+                    }
+                    _ => IGNORE,
+                });
+            }
+            crate::config::Mode::Client => {
+                self.watch(|_a, _b, c| match c {
+                    InnerMessage::PtyOutput { output, .. } => {
+                        ::std::io::Write::write_all(
+                            &mut ::termion::get_tty().unwrap(),
+                            &output[..],
+                        )
+                        .unwrap();
+                        EAT
+                    }
+                    _ => IGNORE,
+                });
+            }
+            _ => (),
+        }
     }
 
-    pub(crate) fn send_inner_message(&self, message: crate::innermessage::InnerMessage) -> u64 {
+    pub(crate) fn send_inner_message(&self, message: InnerMessage) -> u64 {
         let mut outbound_id_ticker_lock = self.i.outbound_id_ticker.lock();
         let mut message_buf = [0u8; 16574];
         let len: usize;
@@ -287,6 +304,8 @@ impl Oxy {
         );
         let socket = ::mio::net::UdpSocket::bind(&"0.0.0.0:0".parse().unwrap()).unwrap();
         *self.i.socket.lock() = Some(socket);
+        let signals = ::signal_hook::iterator::Signals::new(&[::signal_hook::SIGWINCH]).unwrap();
+        *self.i.signal_iterator.lock() = Some(signals);
         self.spawn_pocket_thread();
     }
 
@@ -349,7 +368,6 @@ impl Oxy {
             mine
         };
         let conversation_id = *self.i.my_conversation_id.lock();
-        self.info(|| format!("Using conversation id {}", conversation_id));
         crate::mid::set_conversation_id(&mut packet, conversation_id);
         crate::mid::set_sequence_number(&mut packet, sequence_number);
         crate::mid::set_acknowledgement_number(&mut packet, 0);
@@ -366,14 +384,28 @@ impl Oxy {
         .unwrap();
     }
 
-    fn init_client_from_pocket_thread(&self) {
-        let weak = self.downgrade();
-        let token = ::transportation::insert_listener(move |event| match weak.upgrade() {
-            Some(oxy) => oxy.socket_event(event),
-            None => {
-                transportation::stop();
+    fn notify_signal(&self) {
+        for signal in self.i.signal_iterator.lock().as_ref().unwrap().pending() {
+            match signal {
+                ::signal_hook::SIGWINCH => self.send_tty_size_update(),
+                _ => (),
             }
+        }
+    }
+
+    fn init_client_from_pocket_thread(&self) {
+        let token = ::transportation::insert_listener(|_| get_oxy().notify_signal());
+        ::transportation::borrow_poll(|poll| {
+            poll.register(
+                self.i.signal_iterator.lock().as_ref().unwrap(),
+                ::mio::Token(token),
+                ::mio::Ready::readable(),
+                ::mio::PollOpt::edge(),
+            )
+            .unwrap();
         });
+
+        let token = ::transportation::insert_listener(|event| get_oxy().socket_event(event));
         ::transportation::borrow_poll(|poll| {
             poll.register(
                 self.i.socket.lock().as_ref().unwrap(),
@@ -426,7 +458,7 @@ impl Oxy {
         self.spawn_pocket_thread();
     }
 
-    fn mode(&self) -> crate::config::Mode {
+    pub(crate) fn mode(&self) -> crate::config::Mode {
         self.i.config.lock().mode.expect("Oxy instance lacks mode")
     }
 
@@ -513,7 +545,6 @@ impl Oxy {
                         continue;
                     }
                     let decrypt = self.decrypt_outer_packet(&buf, |mid| {
-                        self.info(|| "Got a mid packet");
                         self.process_mid_packet(src, mid);
                     });
                     if decrypt.is_err() {
